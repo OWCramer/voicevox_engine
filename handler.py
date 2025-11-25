@@ -4,6 +4,7 @@ import runpod
 import os
 import sys
 from pathlib import Path
+import traceback
 
 # --- FIX: Ensure project root is in python path ---
 # This ensures 'voicevox_engine' package is found regardless of how the script is called
@@ -13,25 +14,26 @@ if current_dir not in sys.path:
 # -------------------------------------------------
 
 try:
-    # Standard imports based on your project structure
     from voicevox_engine.tts_pipeline.tts_engine import TTSEngine
     from voicevox_engine.core.core_wrapper import CoreWrapper
     from voicevox_engine.preset.preset_manager import PresetManager
 
-    # Use UserDictionary if UserDictManager is not available (API change in recent versions)
+    # Robust import for UserDictManager
     try:
         from voicevox_engine.user_dict.user_dict_manager import UserDictManager
     except ImportError:
-        # Fallback: In some versions it might be named differently or located elsewhere
-        # Based on your context, it seems user_dict_manager.py exists, but let's be safe
-        print("Warning: UserDictManager import failed, trying alternate import...")
-        from voicevox_engine.user_dict.user_dict_manager import UserDictionary as UserDictManager
+        print("Warning: UserDictManager import failed, checking for UserDictionary...")
+        try:
+            from voicevox_engine.user_dict.user_dict_manager import UserDictionary as UserDictManager
+        except ImportError:
+            # Fallback if UserDictionary is also not importable directly
+            print("Warning: UserDictionary import failed too.")
+            UserDictManager = None
 
     from voicevox_engine.model import AudioQuery
 except ImportError as e:
     print(f"CRITICAL IMPORT ERROR: {e}")
-    print(f"Current sys.path: {sys.path}")
-    print(f"Current directory contents: {os.listdir('.')}")
+    traceback.print_exc()
     raise e
 
 # Global engine instance
@@ -57,49 +59,43 @@ async def initialize_engine():
     print(f"Core directory: {core_dir}")
 
     # 2. Initialize CoreWrapper
-    # We explicitly set use_gpu=True.
+    # FIX: Removing invalid arguments 'voicelib_dir'.
+    # CoreWrapper only takes use_gpu, core_dir, cpu_num_threads, load_all_models
     core = CoreWrapper(
         use_gpu=True,
         core_dir=core_dir,
-        voicelib_dir=None,
-        # runtime_dir=None, # Removed as it might not be in __init__ args for this version
-        load_all_models=True  # Loading all models to prevent runtime delay
+        cpu_num_threads=4,
+        load_all_models=True
     )
 
-    # Initialize the core is handled inside __init__ of CoreWrapper usually,
-    # but we check if we need manual init for specific versions.
-    # core.initialize(use_gpu=True) # Often called inside CoreWrapper __init__
+    # Note: core.initialize() is called inside CoreWrapper.__init__ in this version,
+    # so we don't need to call it manually unless we suppressed it.
 
     # 3. Initialize Managers
-    # Try initializing UserDictManager (or UserDictionary)
-    try:
-        user_dict_manager = UserDictManager()
-    except TypeError:
-        # Newer versions of UserDictManager might require args or act differently
-        # If it's actually UserDictionary class, it might exist without manager wrapper
-        user_dict_manager = UserDictManager()
+    user_dict_manager = None
+    if UserDictManager:
+        try:
+            user_dict_manager = UserDictManager()
+        except Exception as e:
+            print(f"Warning: Failed to init UserDictManager: {e}")
 
-        # Preset Manager
-    # Check if we need to pass a path or if it handles defaults
+    # Preset Manager
     preset_path = root_dir / "presets.yaml"
     if preset_path.exists():
         preset_manager = PresetManager(preset_path=preset_path)
     else:
-        # Create a dummy path if needed or pass None if supported
-        # Based on source, it expects a Path object
+        # Pass a non-existent path to init default empty presets if needed
         preset_manager = PresetManager(preset_path=Path("presets.yaml"))
 
     # 4. Initialize TTSEngine
+    # TTSEngine in your version takes only `core` in __init__
     tts_engine = TTSEngine(
-        core=core,  # Note: arg name is 'core' in TTSEngine __init__ snippet provided
-        # user_dict_manager=user_dict_manager, # TTSEngine might not take these in __init__ directly depending on version
-        # preset_manager=preset_manager
+        core=core
     )
 
-    # Inject managers if they are attached properties (common in dependency injection patterns)
-    # or if the TTSEngine expects them in a specific way.
-    # Based on your provided TTSEngine class, it only takes `core: CoreWrapper` in __init__
-    # So we just pass core.
+    # If the engine needs managers injected separately (some versions do)
+    # tts_engine.user_dict_manager = user_dict_manager
+    # tts_engine.preset_manager = preset_manager
 
     print("--- Engine Initialization Complete ---")
     return tts_engine
@@ -127,13 +123,10 @@ async def handler(job):
 
     try:
         # 1. Audio Query
-        # create_audio_query or similar method
-        # The TTSEngine you shared has `create_accent_phrases` but usually high level has `compute_audio_query`
-        # If high level method isn't exposed in TTSEngine, we construct AudioQuery manually
-        # using the helper methods shown in your context (create_accent_phrases)
+        # Mimicking run.py logic
 
-        # Logic mimicking `run.py` or standard API:
         # A. Create Accent Phrases
+        # TTSEngine.create_accent_phrases signature: (text, style_id, enable_katakana_english)
         accent_phrases = tts_engine.create_accent_phrases(
             text=text,
             style_id=speaker_id,
@@ -141,7 +134,7 @@ async def handler(job):
         )
 
         # B. Construct AudioQuery
-        # We need default values for the other fields
+        # Default values similar to standard engine defaults
         audio_query = AudioQuery(
             accent_phrases=accent_phrases,
             speedScale=float(job_input.get("speed_scale", 1.0)),
@@ -164,13 +157,12 @@ async def handler(job):
         )
 
         # 3. Return Result
-        # wave_data is numpy array (float32). We need to convert to 16-bit PCM wav bytes
-        import numpy as np
+        # Convert float32 numpy array to WAV bytes
         import io
         import soundfile as sf
 
-        # Create in-memory wav file
         buffer = io.BytesIO()
+        # Voicevox output is typically 24k sample rate
         sf.write(buffer, wave_data, 24000, format='WAV', subtype='PCM_16')
         wav_bytes = buffer.getvalue()
 
@@ -184,7 +176,6 @@ async def handler(job):
 
     except Exception as e:
         print(f"Error processing request: {e}")
-        import traceback
         traceback.print_exc()
         return {"error": str(e), "status": "failed"}
 
