@@ -1,106 +1,64 @@
-# syntax=docker/dockerfile:1
+# Use NVIDIA CUDA base image for GPU support
+# CUDA 11.8 is generally compatible with the ONNX Runtime versions used by Voicevox
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
-# TODO: build-arg と target のドキュメントをこのファイルに書く
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
 
-ARG BASE_IMAGE=mirror.gcr.io/ubuntu:22.04
+# Install Python 3.11 and system dependencies
+# libsndfile1 is required for audio processing
+RUN apt-get update && apt-get install -y \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
+    python3-pip \
+    libsndfile1 \
+    curl \
+    wget \
+    unzip \
+    git \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-FROM ${BASE_IMAGE} AS download-env
-ARG DEBIAN_FRONTEND=noninteractive
+# Set Python 3.11 as the default python
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 
-WORKDIR /work
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-RUN <<EOF
-    set -eux
+WORKDIR /app
 
-    apt-get update
-    apt-get install -y \
-        curl \
-        p7zip
-    apt-get clean
-    rm -rf /var/lib/apt/lists/*
-EOF
+# Copy dependency definitions
+COPY pyproject.toml uv.lock requirements.txt ./
 
-# Download VOICEVOX ENGINE
-ARG VOICEVOX_ENGINE_REPOSITORY
-ARG VOICEVOX_ENGINE_VERSION
-ARG VOICEVOX_ENGINE_TARGET
+# Install Python dependencies
+# We use system python here to simplify the GPU container setup
+RUN uv pip install --system --no-cache-dir -r requirements.txt
+RUN uv pip install --system --no-cache-dir runpod
 
-RUN <<EOF
-    set -eux
+# Download VOICEVOX Core (GPU Version)
+# Version 0.15.0 is used here. Ensure this matches your engine compatibility.
+RUN wget https://github.com/VOICEVOX/voicevox_core/releases/download/0.15.0/voicevox_core-linux-x64-gpu-0.15.0.zip -O core.zip && \
+    unzip core.zip && \
+    mkdir -p voicevox_core && \
+    # Move contents from the extracted folder (name changes with version) to /app/voicevox_core \
+    mv voicevox_core-linux-x64-gpu-0.15.0/* voicevox_core/ && \
+    rm core.zip && \
+    rm -rf voicevox_core-linux-x64-gpu-0.15.0
 
-    LIST_NAME=voicevox_engine-$VOICEVOX_ENGINE_TARGET-$VOICEVOX_ENGINE_VERSION.7z.txt
+# Copy the application code
+COPY . .
 
-    curl -fLO --retry 3 --retry-delay 5 "https://github.com/$VOICEVOX_ENGINE_REPOSITORY/releases/download/$VOICEVOX_ENGINE_VERSION/$LIST_NAME"
-
-    awk \
-        -v "repo=$VOICEVOX_ENGINE_REPOSITORY" \
-        -v "tag=$VOICEVOX_ENGINE_VERSION" \
-        '{
-             print \
-                 "url = \"https://github.com/" repo "/releases/download/" tag "/" $0 "\"\n" \
-                 "output = \"" $0 "\""
-        }' \
-        "$LIST_NAME" \
-        > ./curl.txt
-
-    curl -fL --retry 3 --retry-delay 5 --parallel --config ./curl.txt
-
-    7zr x "$(head -1 "./$LIST_NAME")"
-
-    mv ./$VOICEVOX_ENGINE_TARGET /opt/voicevox_engine
-    rm ./*
-EOF
-
-# Download Resource
-ARG VOICEVOX_RESOURCE_VERSION=0.25.0
-RUN <<EOF
-    set -eux
-
-    # README
-    curl -fLo "/work/README.md" --retry 3 --retry-delay 5 "https://raw.githubusercontent.com/VOICEVOX/voicevox_resource/${VOICEVOX_RESOURCE_VERSION}/engine/README.md"
-EOF
-
-# Runtime
-FROM ${BASE_IMAGE} AS runtime-env
-ARG DEBIAN_FRONTEND=noninteractive
-
-WORKDIR /opt/voicevox_engine
-
-RUN <<EOF
-    set -eux
-
-    apt-get update
-    apt-get install -y \
-        gosu
-    apt-get clean
-    rm -rf /var/lib/apt/lists/*
-
-    # Create a general user
-    useradd --create-home user
-EOF
-
-# Copy VOICEVOX ENGINE
-COPY --from=download-env /opt/voicevox_engine /opt/voicevox_engine
-
-# Copy Resource
-COPY --from=download-env /work/README.md /opt/voicevox_engine/README.md
-
-# Create container start shell
-COPY --chmod=775 <<EOF /entrypoint.sh
-#!/bin/bash
-set -eux
-
-# Display README for engine
-cat /opt/voicevox_engine/README.md > /dev/stderr
-
-exec gosu user /opt/voicevox_engine/run "\$@"
-EOF
-
-ENV VV_HOST=0.0.0.0
-
-ENTRYPOINT [ "/entrypoint.sh" ]
-
-# Enable use_gpu
-FROM runtime-env AS runtime-nvidia-env
-
+# Set Environment Variables for RunPod and Voicevox
+# LD_LIBRARY_PATH is critical for loading the .so files from the core directory
+ENV LD_LIBRARY_PATH=/app/voicevox_core:$LD_LIBRARY_PATH
+# Force engine to use GPU
 ENV VV_USE_GPU=1
+ENV VV_CPU_NUM_THREADS=4
+
+# Run the handler
+CMD ["python", "-u", "handler.py"]
